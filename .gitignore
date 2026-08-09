@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Logged-in Chromium profile (chứa cookie/session Microsoft — TUYỆT ĐỐI không commit)
+browser-profile/
+
+# Group chat đã chọn
+target.json
+
+# Ảnh chụp khi debug selector
+diagnose/
+
+.venv/
+__pycache__/
+*.pyc
+*.log
