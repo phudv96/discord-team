@@ -76,13 +76,16 @@ Discord không cho người ngoài thêm bot vào server người khác.
 3. Mở URL → chọn server → Authorize
 4. Trong `.env`: điền `DISCORD_GUILD_ID` → lệnh xuất hiện tức thì
 
-Khi mở cho cả nhóm, xem lại 3 thiết lập trong `.env`:
+Khi mở cho cả nhóm, xem lại 2 thiết lập trong `.env`:
 
 | Biến | Ý nghĩa |
 |---|---|
 | `ALLOWED_USER_IDS=` | Để trống = mọi người dùng được |
 | `COOLDOWN_SECONDS=10` | Chặn 1 người spam làm nghẽn hàng đợi chung |
-| `EPHEMERAL_REPLY=0` | Để cả nhóm thấy tin đã gửi, tránh gửi trùng |
+
+Muốn dùng `/team_discord` (xem mục *Dùng* dưới), tick thêm quyền **Manage
+Webhooks** ở bước 2 khi tạo link mời — hoặc bật sau trong **Server Settings →
+Roles** cho role của bot.
 
 > Tin nhắn tới Teams luôn hiện **dưới danh nghĩa tài khoản Teams của bạn**, bất kể
 > ai gõ lệnh. `MESSAGE_PREFIX` mặc định có ghi kèm tên người gửi bên Discord —
@@ -124,9 +127,39 @@ Session lưu ở `browser-profile/`, group chat lưu ở `target.json`.
 
 ## Dùng
 
+Hai lệnh, tự chọn tuỳ tin:
+
 ```
 /team message: Deploy xong rồi nhé mọi người
 ```
+
+Chỉ gửi sang Teams. Discord chỉ hiện xác nhận riêng cho bạn (`✅ Đã gửi tới
+Teams — <tên group>`), tuỳ `EPHEMERAL_REPLY` là ẩn hay hiện cho cả kênh.
+
+```
+/team_discord message: Deploy xong rồi nhé mọi người
+```
+
+Gửi sang Teams **và** giữ lại một bản trong kênh Discord, trông **như tin nhắn
+thật** — tên và avatar đúng người gõ lệnh, không nhãn bot, không dòng
+"X used /team_discord" cho người khác thấy (chỉ bạn thấy một xác nhận ẩn riêng):
+
+```
+[avatar Phú Đinh]  Phú Đinh
+Deploy xong rồi nhé mọi người
+```
+
+Làm được vậy nhờ **Discord Webhook**: bot tự tạo 1 webhook tên
+`discord-teams relay` trong kênh lần đầu bạn gọi `/team_discord` ở đó, rồi dùng
+lại cho các lần sau. Cần bot có quyền **Manage Webhooks** trong kênh — thiếu
+quyền thì lệnh báo lỗi rõ, không có gì bị gửi ngầm.
+
+Ping `@user` trong tin vẫn hoạt động (giống tin nhắn thật), nhưng
+`@everyone`/`@here`/`@role` luôn bị chặn ở cả hai lệnh — nếu không, ai đó có
+thể ping cả server qua bot dù họ không có quyền đó.
+
+`/team_discord` không dùng được trong DM/group DM (Discord không hỗ trợ webhook
+ở đó) — dùng `/team` thay thế.
 
 Teams nhận được:
 
@@ -185,6 +218,68 @@ Kiểm tra session Teams còn sống không, **không gửi tin nào**. Dùng c�
 
 ---
 
+## Chạy trên server Linux (không màn hình)
+
+`bot.py` chạy headless bình thường, nhưng `login.py` **bắt buộc cần màn hình** để
+bạn tự bấm đăng nhập Microsoft. Trên server thì dựng màn hình ảo rồi xem qua VNC.
+
+Cài một lần:
+
+```bash
+sudo apt install -y python3-venv xvfb x11vnc
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+sudo .venv/bin/python -m playwright install-deps chromium
+.venv/bin/python -m playwright install chromium
+x11vnc -storepasswd          # đặt mật khẩu VNC
+```
+
+Đăng nhập (lặp lại mỗi khi session Microsoft hết hạn, vài tuần một lần):
+
+```bash
+./relogin.sh
+```
+
+[relogin.sh](relogin.sh) tự tắt bot, dựng màn hình ảo, bật VNC, chạy `login.py`
+rồi dọn dẹp. Nếu Xvfb/x11vnc đã chạy sẵn (vd bạn để chúng thành systemd service)
+thì script dùng lại và không tắt chúng đi.
+
+Tương đương làm tay:
+
+```bash
+pkill -f 'python bot.py'                       # 1. tắt bot: profile Chromium bị khoá
+Xvfb :99 -screen 0 1440x900x24 &               # 2. màn hình ảo
+x11vnc -display :99 -localhost -rfbauth ~/.vnc/passwd -forever -shared &
+DISPLAY=:99 .venv/bin/python login.py          # 3. đăng nhập
+pkill x11vnc; pkill Xvfb                       # 4. dọn dẹp
+```
+
+Từ máy cá nhân, mở SSH tunnel rồi nối VNC viewer (TigerVNC/TightVNC) vào `localhost:5900`:
+
+```bash
+ssh -L 5900:localhost:5900 ubuntu@<ip-server>
+```
+
+Lưu ý:
+
+- **Không mở cổng 5900 ra ngoài.** `-localhost` + SSH tunnel là đủ; mở public là
+  ai cũng điều khiển được trình duyệt đã đăng nhập Teams của bạn.
+- **Không chép `browser-profile/` từ Windows sang Linux.** Cookie Chromium trên
+  Windows mã hoá bằng DPAPI gắn với tài khoản Windows, sang Linux không giải mã
+  được — profile trông đủ file nhưng vẫn bắt đăng nhập lại.
+- **Đừng dùng trình duyệt web để mở `localhost:5900`.** Trình duyệt nói HTTP, VNC
+  nói RFB. Phải dùng VNC viewer thật.
+- Chromium cần ~500MB–1GB RAM. Máy 1GB (t2.micro) nhiều khả năng bị OOM kill —
+  thêm swap.
+
+Giữ bot sống sau khi thoát SSH:
+
+```bash
+tmux new -s teams
+.venv/bin/python bot.py
+# Ctrl+B rồi D để thoát ra; quay lại: tmux attach -t teams
+```
+
 ## Xử lý sự cố
 
 | Triệu chứng | Cách xử lý |
@@ -205,7 +300,7 @@ Kiểm tra session Teams còn sống không, **không gửi tin nào**. Dùng c�
 
 | File | Vai trò |
 |---|---|
-| [bot.py](bot.py) | Discord bot, đăng ký `/team` và `/team_status` |
+| [bot.py](bot.py) | Discord bot, đăng ký `/team`, `/team_discord`, `/team_status` |
 | [teams_client.py](teams_client.py) | Driver Playwright — mở chat, nhập nội dung, xác nhận đã gửi |
 | [login.py](login.py) | Chạy 1 lần: đăng nhập thủ công + chọn group chat |
 | [inspect_dom.py](inspect_dom.py) | Chỉ đọc DOM Teams, dump ra `diagnose/` — dùng khi cần sửa selector |

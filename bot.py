@@ -31,6 +31,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
+# Tên cố định để nhận lại đúng webhook đã tạo (thay vì tạo mới mỗi lần).
+WEBHOOK_NAME = "discord-teams relay"
+
+
+class RelayWebhookError(Exception):
+    """Không tạo/dùng được webhook để đăng tin trông như tin nhắn thật."""
+
 
 class TeamsBridge(discord.Client):
     def __init__(self, settings: Settings):
@@ -43,6 +50,7 @@ class TeamsBridge(discord.Client):
         self._start_error: str | None = None
         self._start_lock = asyncio.Lock()
         self._relay_channels: list[discord.abc.Messageable] = []
+        self._webhooks: dict[int, discord.Webhook] = {}
 
     async def setup_hook(self) -> None:
         # Khởi động Teams sớm để lần /team đầu tiên không phải chờ cold-start.
@@ -229,6 +237,94 @@ class TeamsBridge(discord.Client):
     async def _before_relay(self) -> None:
         await self.wait_until_ready()
 
+    # ------------------------------------------------ /team_discord (webhook)
+
+    async def get_relay_webhook(
+        self, channel: discord.abc.GuildChannel
+    ) -> discord.Webhook:
+        """Webhook để đăng tin trông như tin nhắn thật (tên + avatar tuỳ chỉnh
+        theo từng lần gửi). Cache theo channel id, tạo mới nếu chưa có.
+
+        Chỉ hoạt động trong kênh của server (guild), KHÔNG hoạt động ở DM —
+        Discord không cho webhook trong DM.
+        """
+        cached = self._webhooks.get(channel.id)
+        if cached is not None:
+            return cached
+
+        try:
+            existing = await channel.webhooks()
+        except discord.Forbidden as exc:
+            raise RelayWebhookError(
+                "Bot thiếu quyền **Manage Webhooks** trong kênh này."
+            ) from exc
+        except discord.HTTPException as exc:
+            raise RelayWebhookError(f"Không đọc được danh sách webhook: {exc}") from exc
+
+        hook = next((w for w in existing if w.name == WEBHOOK_NAME), None)
+        if hook is None:
+            try:
+                hook = await channel.create_webhook(
+                    name=WEBHOOK_NAME,
+                    reason="discord-teams: đăng bản /team_discord trông như tin nhắn thật",
+                )
+            except discord.Forbidden as exc:
+                raise RelayWebhookError(
+                    "Bot thiếu quyền **Manage Webhooks** trong kênh này."
+                ) from exc
+            except discord.HTTPException as exc:
+                raise RelayWebhookError(f"Không tạo được webhook: {exc}") from exc
+
+        self._webhooks[channel.id] = hook
+        return hook
+
+    async def post_as_user(
+        self, channel: discord.abc.Messageable, user: discord.abc.User, content: str
+    ) -> None:
+        """Đăng `content` vào `channel`, hiện tên + avatar của `user` — không
+        nhãn bot, không dòng "X used /command" cho người khác thấy.
+
+        DM/group DM không hỗ trợ webhook -> raise RelayWebhookError rõ ràng,
+        để nơi gọi báo cho người dùng đổi qua /team.
+        """
+        target_channel = channel
+        thread_param = None
+        if isinstance(channel, discord.Thread):
+            if channel.parent is None:
+                raise RelayWebhookError("Không xác định được kênh cha của thread này.")
+            target_channel = channel.parent
+            thread_param = channel
+
+        if not isinstance(target_channel, discord.abc.GuildChannel):
+            raise RelayWebhookError(
+                "Không dùng được ở DM/group DM — Discord không hỗ trợ webhook ở đó. "
+                "Đổi qua `/team`."
+            )
+
+        webhook = await self.get_relay_webhook(target_channel)
+
+        # KHÔNG lặp tên trong content — username của webhook đã hiện tên rồi.
+        body = content if len(content) <= 2000 else content[:1997] + "..."
+
+        kwargs = {}
+        if thread_param is not None:
+            kwargs["thread"] = thread_param
+
+        try:
+            await webhook.send(
+                body,
+                username=user.display_name,
+                avatar_url=user.display_avatar.url,
+                # Giống /team: cho phép ping @user (như tin nhắn thật), chặn
+                # @everyone/@here/@role để không lách quyền qua bot.
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False, users=True
+                ),
+                **kwargs,
+            )
+        except discord.HTTPException as exc:
+            raise RelayWebhookError(f"Discord từ chối đăng bản này: {exc}") from exc
+
     async def close(self) -> None:
         if self.relay_loop.is_running():
             self.relay_loop.cancel()
@@ -327,6 +423,63 @@ def register_commands(client: TeamsBridge, settings: Settings) -> None:
             )
 
     @client.tree.command(
+        name="team_discord",
+        description="Như /team, nhưng giữ lại 1 bản trông như tin nhắn thật trong kênh này",
+    )
+    @app_commands.describe(message="Nội dung tin nhắn gửi sang Teams")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @maybe_cooldown
+    async def team_discord(interaction: discord.Interaction, message: str) -> None:
+        if not settings.is_allowed(interaction.user.id):
+            await interaction.response.send_message(
+                "Bạn không có quyền dùng lệnh này.", ephemeral=True
+            )
+            return
+
+        # Luôn ẩn: bản "thật" hiện ra là qua webhook ở bước sau, xác nhận này
+        # chỉ để người gõ lệnh biết kết quả, không cần ai khác thấy.
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        payload = settings.message_prefix.format(
+            user=interaction.user.display_name,
+            message=message,
+            channel=getattr(interaction.channel, "name", "DM"),
+            guild=interaction.guild.name if interaction.guild else "DM",
+        )
+
+        try:
+            teams = await client.ensure_teams()
+            await asyncio.wait_for(teams.send(payload), timeout=settings.send_timeout)
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                f"⏱ Quá {settings.send_timeout}s chưa gửi xong — Teams web có thể đang treo. "
+                "Kiểm tra lại trên Teams xem tin đã tới chưa.",
+                ephemeral=True,
+            )
+            return
+        except TeamsError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Gửi tin thất bại")
+            await interaction.followup.send(
+                f"❌ Lỗi ngoài dự kiến: `{type(exc).__name__}: {exc}`", ephemeral=True
+            )
+            return
+
+        try:
+            await client.post_as_user(interaction.channel, interaction.user, message)
+        except RelayWebhookError as exc:
+            await interaction.followup.send(
+                f"✅ Đã gửi tới Teams, nhưng KHÔNG giữ được bản trong Discord: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send("✅ Đã gửi.", ephemeral=True)
+
+    @client.tree.command(
         name="team_status",
         description="Kiểm tra session Teams còn sống không (không gửi tin nào)",
     )
@@ -408,7 +561,9 @@ def main() -> int:
             "'applications.commands'.\n"
             "Mời lại bot bằng link này (không cần kick bot ra trước):\n\n"
             f"  https://discord.com/oauth2/authorize"
-            f"?client_id={app_id}&scope=bot+applications.commands&permissions=0\n\n"
+            f"?client_id={app_id}&scope=bot+applications.commands&permissions=536870912\n\n"
+            "  (quyền 536870912 = Manage Webhooks, cần cho /team_discord — "
+            "bỏ qua nếu chỉ dùng /team)\n\n"
             f"Nếu vẫn lỗi: kiểm tra DISCORD_GUILD_ID (đang là {settings.guild_ids}) "
             "có đúng server vừa mời không.\n"
         )
