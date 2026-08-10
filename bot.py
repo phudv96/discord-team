@@ -32,7 +32,9 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 # Tên cố định để nhận lại đúng webhook đã tạo (thay vì tạo mới mỗi lần).
-WEBHOOK_NAME = "discord-teams relay"
+# KHÔNG được chứa chữ "discord" — Discord chặn thẳng tay (400: Username cannot
+# contain "discord"), áp dụng cho cả tên webhook và username khi gửi từng tin.
+WEBHOOK_NAME = "TeamBridge relay"
 
 
 class RelayWebhookError(Exception):
