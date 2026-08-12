@@ -208,6 +208,13 @@ class TeamsBridge(discord.Client):
         except TeamsError as exc:
             log.debug("Relay bỏ qua vòng này: %s", exc)
             return
+        except Exception:
+            # KHÔNG được để lọt ra ngoài: discord.ext.tasks dừng vòng lặp vĩnh
+            # viễn khi gặp exception không bắt được, và relay sẽ im lặng chết
+            # cho tới lúc ai đó restart cả bot.py. Ghi log đầy đủ để còn biết
+            # nguyên nhân, nhưng vẫn để vòng SAU chạy tiếp bình thường.
+            log.exception("Relay gặp lỗi ngoài dự kiến, bỏ qua vòng này")
+            return
 
         for msg in messages:
             # Lọc echo + trigger (xem Settings.relay_body).
@@ -238,6 +245,33 @@ class TeamsBridge(discord.Client):
     @relay_loop.before_loop
     async def _before_relay(self) -> None:
         await self.wait_until_ready()
+
+    @relay_loop.error
+    async def _relay_loop_error(self, error: Exception) -> None:
+        # Lưới an toàn thứ hai: relay_loop() ở trên đã tự bắt lỗi trong thân
+        # vòng lặp, nhưng nếu vẫn có gì lọt qua (vd lỗi trong before_loop, hoặc
+        # bug tương lai quên bọc try/except), KHÔNG để vòng lặp chết hẳn.
+        log.exception(
+            "relay_loop lỗi không bắt được, đang xếp lịch khởi động lại",
+            exc_info=error,
+        )
+        asyncio.create_task(self._restart_relay_loop())
+
+    async def _restart_relay_loop(self) -> None:
+        # .error() chạy TRONG LÚC task cũ vẫn đang sống (is_running() còn True
+        # tới khi _loop() thật sự return/raise xong) -> gọi start() ngay tại
+        # đây sẽ ăn "RuntimeError: Task is already launched". Đợi task cũ dừng
+        # hẳn rồi mới khởi động lại; giới hạn 5s để khỏi treo vô hạn nếu kẹt.
+        for _ in range(50):
+            if not self.relay_loop.is_running():
+                self.relay_loop.start()
+                log.info("relay_loop đã tự khởi động lại.")
+                return
+            await asyncio.sleep(0.1)
+        log.error(
+            "relay_loop không dừng hẳn sau 5s -> bỏ tự khởi động lại. "
+            "Cần restart bot.py."
+        )
 
     # ------------------------------------------------ /team_discord (webhook)
 
